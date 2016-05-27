@@ -20,8 +20,8 @@
 
 // Definición de constantes
 #define currentGPU 0
-#define BLOCK_DIM_FILAS 128
-#define BLOCK_DIM_COLUMNAS 8
+#define BLOCK_DIM_FILAS 32
+#define BLOCK_DIM_COLUMNAS 32
 #define MAX_THREADS 1024
 
 #define m(y,x) mapa[ (y * cols) + x ]
@@ -55,7 +55,7 @@ typedef struct {
 // Declaración de prototipos de kernels y funciones internas:
 __global__ void update(int*, const unsigned int, const unsigned int, const unsigned int, const unsigned int);
 
-__global__ void reduce_columns_kernel(const int*, const unsigned int, const unsigned int, int*,int*);
+__global__ void reduce_columns_kernel(const int*, const unsigned int, const unsigned int, int*,int*,const int nuevas);
 
 __global__ void reduce_rows_kernel( int*, int*, int*);
 
@@ -66,7 +66,7 @@ __device__ int distanciaManhattan( int antena_fila, int antena_columna, int fila
     return dist * dist;
 }
 //
-int* maxDistance(const int* mapa, const unsigned int numfil, const unsigned int numcols, const dim3 grid, const dim3 block);
+int* maxDistance(const int* mapa, const unsigned int numfil, const unsigned int numcols, const dim3 grid, const dim3 block, const int nuevas);
 
 //
 void print_mapa(int * mapa, int rows, int cols){
@@ -186,7 +186,6 @@ int main(int nargs, char ** vargs){
 	//printf("F%d-C%d\n", num_fil_grid, num_col_grid);
 	dim3 grid(num_col_grid, num_fil_grid);
 
-	int num_blocks = num_col_grid * num_fil_grid;
 	// Colocar las antenas iniciales
 	for(int i=0; i<nAntenas; i++){
 		//printf("Colocando una antena en %d %d\n",antenas[i].fila, antenas[i].columna);
@@ -215,7 +214,7 @@ int main(int nargs, char ** vargs){
 	reduceAllocate(num_blocks);
 	while(1){
         //antenaHost = maxDistance(d_mapa,rows, cols, grid, block);
-		antenaHost = maxDistance(d_mapa,rows, cols, grid, block);
+		antenaHost = maxDistance(d_mapa,rows, cols, grid, block, nuevas);
 		// Traemos la nueva antena: [ Distancia, Fila y Columna ]
 		int dist = antenaHost[0];
 		int fil = antenaHost[1];
@@ -272,7 +271,7 @@ __global__ void update( int* mapa, const unsigned int a_fila, const unsigned int
 }
 
 
-__global__ void reduce_columns_kernel(const int* mapa, const unsigned int numfil, const unsigned int numcols, int* values, int* cols){
+__global__ void reduce_columns_kernel(const int* mapa, const unsigned int numfil, const unsigned int numcols, int* values, int* cols, const int nuevas){
     extern __shared__ unsigned int sdata[];
     // Obtenemos el elemento del mapa al que realmente ha de acceder este hilo
     unsigned int tid_row = threadIdx.y;
@@ -290,9 +289,11 @@ __global__ void reduce_columns_kernel(const int* mapa, const unsigned int numfil
 	else
 		sdata[2*tid] = 0;		
 	sdata[2*tid+1] = real_col;
-    __syncthreads();
+    //__syncthreads();
     
-    //Hacemos la reducción en memoria shared por filas hasta obtener una columna única 
+    //Hacemos la reducción en memoria shared por filas hasta obtener una columna única
+    //si las filas son de 32 hilos no hace falta hacer sincronización ya que forman
+    //parte del mismo warp
     for (unsigned int s=blockDim.x/2; s>0; s/=2) {
         if (tid_col < s) {
         	// Hacemos la reducción sumando los dos elementos que le tocan a este hilo
@@ -305,23 +306,25 @@ __global__ void reduce_columns_kernel(const int* mapa, const unsigned int numfil
         	       sdata[2*tid+1] = sdata[2*(tid+s)+1];
         	}
     	}
-        __syncthreads();
+        //__syncthreads();
     }
     
-    //Tenemos los maximos en la primera columna
+    //Tenemos los maximos en la primera columna PERO!
+    //Quiero tener los maximos en las primeras filas
+    // MENTIRA... ya están por
     if (tid_col == 0){
     	//Num de bloque?
     	unsigned int offset = blockDim.y * (blockIdx.x + blockIdx.y * gridDim.x);
-        //printf("Voy a guardar mi maximo en la pos: %d\n",offset+tid_row);
         values[offset + tid_row] =  sdata[2*tid];
         cols[offset + tid_row] = sdata[2*tid+1];
     }
 }
 
-__global__ void reduce_rows_kernel( int* vals, int* rows, int *cols ){
+__global__ void reduce_rows_kernel( int* vals, int* rows, int *cols, const int last){
     extern __shared__ unsigned int sdata[];
     // Identificador de hilo
-    unsigned int tid = threadIdx.x;
+    unsigned int tid_row = threadIdx.y;
+    unsigned int tid_col = threadIdx.x;
     
     // Localizado a la altura de la matriz:
     unsigned int real_row = blockDim.x * blockIdx.y + tid;
@@ -335,7 +338,7 @@ __global__ void reduce_rows_kernel( int* vals, int* rows, int *cols ){
     sdata[3*tid+2] = cols[ offset + tid ];
 
     //Sincronizamos para que todos hayan llegado a este punto
-    __syncthreads();
+    //__syncthreads();
     
     // Hacemos la reducción en memoria shared
     for (unsigned int s=blockDim.x/2; s>0; s/=2) {
@@ -353,10 +356,10 @@ __global__ void reduce_rows_kernel( int* vals, int* rows, int *cols ){
                 }
             }
         }
-        __syncthreads();
+        //__syncthreads();
     }
 
-    if(tid == 0){
+    if(tid == 0){ // 
         vals[offset]  = sdata[0];
         rows[blockId] = sdata[1];//identificador del bloque dentro del grid;
         cols[offset]  = sdata[2];
@@ -420,8 +423,8 @@ __global__ void reduce_blocks_kernel(int* vals, int* rows, int* cols, const unsi
 //! @param num_blocks   Num de bloques sobre los que se hace la reduccion.
 //! @return int*        Vector de tres elementos: Distancia, Fila y Columna
 ///////////////////////////////////////////////////////////////////////////////////////////
-//int* maxDistance(const int* mapa, const unsigned int numfil, const unsigned int numcols, const dim3 grid, const dim3 block, const int nuevas){
-int* maxDistance(const int* mapa, const unsigned int numfil, const unsigned int numcols, const dim3 grid, const dim3 block){
+int* maxDistance(const int* mapa, const unsigned int numfil, const unsigned int numcols, const dim3 grid, const dim3 block, const int nuevas){
+//int* maxDistance(const int* mapa, const unsigned int numfil, const unsigned int numcols, const dim3 grid, const dim3 block){
     cudaError_t error;
     int numThreadsPerBlock = block.y * block.x; // NUMERO DE FILAS * NUMERO DE COLUMNAS
 
@@ -430,7 +433,7 @@ int* maxDistance(const int* mapa, const unsigned int numfil, const unsigned int 
     // donde se encontro dicho máximo, ya que la fila es constante.
     int sharedMemorySize = 2 * numThreadsPerBlock * sizeof(int);
 
-    reduce_columns_kernel<<<grid, block, sharedMemorySize>>>(mapa, numfil, numcols,val_Result, col_Result);
+    reduce_columns_kernel<<<grid, block, sharedMemorySize>>>(mapa, numfil, numcols,val_Result, col_Result, nuevas);
     if((error=cudaGetLastError()) != cudaSuccess)
         printf("Error al llamar al primer reduce kernel: %s\n", cudaGetErrorString( error ) );
     CUT_CHECK_ERROR("Kernel execution failed");
@@ -438,18 +441,23 @@ int* maxDistance(const int* mapa, const unsigned int numfil, const unsigned int 
     // En la segunda pasada cada bloque accederá a los 32 máximos locales encontrados previamente, y hará reducción
     // hasta obtener en la primera posición el máximo de su bloque. Para ello es necesario que los hilos de las reducciones
     // sepan el valor de la distancia, de la fila y de la columna mejores encontrados.
-    numThreadsPerBlock = block.y; // ES EL NUMERO DE FILAS
+    numThreadsPerBlock = MAX_THREADS; // ES EL NUMERO DE FILAS
+    int last = grid.x*grid.y*32;
+    int blocks = last / 1024;
+    if( last  % 1024)
+        blocks++; 
     sharedMemorySize = 3 * numThreadsPerBlock * sizeof(int);
-    reduce_rows_kernel<<< grid, numThreadsPerBlock, sharedMemorySize>>>(val_Result, row_Result, col_Result);
+    reduce_rows_kernel<<< blocks, numThreadsPerBlock, sharedMemorySize>>>(val_Result, row_Result, col_Result, last);
     if((error=cudaGetLastError()) != cudaSuccess)
         printf("Error al llamar al segundo reduce kernel: %s\n", cudaGetErrorString( error ) );
     CUT_CHECK_ERROR("Kernel execution failed");
-    
+
+
     // En la tercera pasada asignamos un bloque con hasta 1024 hilos para cada conjunto de hasta 1024 bloques con sus
     // máximos. Ésta puede ser la última reducción, en el caso de que haya menos de 1024 bloques, pero si hay mas será necesario
     // hacer la última reducción.
     numThreadsPerBlock = grid.x * grid.y;
-    int blocks= numThreadsPerBlock / 1024;
+    blocks= numThreadsPerBlock / 1024;
     if(numThreadsPerBlock % 1024)
         blocks++; 
     numThreadsPerBlock = MAX_THREADS;

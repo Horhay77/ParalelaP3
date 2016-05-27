@@ -20,8 +20,8 @@
 
 // Definición de constantes
 #define currentGPU 0
-#define BLOCK_DIM_FILAS 32
-#define BLOCK_DIM_COLUMNAS 32
+#define BLOCK_DIM_FILAS 128
+#define BLOCK_DIM_COLUMNAS 8
 #define MAX_THREADS 1024
 
 #define m(y,x) mapa[ (y * cols) + x ]
@@ -55,11 +55,11 @@ typedef struct {
 // Declaración de prototipos de kernels y funciones internas:
 __global__ void update(int*, const unsigned int, const unsigned int, const unsigned int, const unsigned int);
 
-__global__ void reduce_columns_kernel(const int*, const unsigned int, const unsigned int, int*,int*,const int nuevas);
+__global__ void reduce_columns_kernel(const int*, const unsigned int, const unsigned int, int*,int*);
 
 __global__ void reduce_rows_kernel( int*, int*, int*);
 
-__global__ void reduce_blocks_kernel(int* vals, int* rows, int* cols, const unsigned int lastBlock);
+__global__ void reduce_blocks_kernel(int* vals, int* rows, int* cols, const unsigned int lastBlock, const int reductionLevel, const int nuevas);
 
 __device__ int distanciaManhattan( int antena_fila, int antena_columna, int fila, int columna) {
     int dist = abs(antena_fila - fila) + abs(antena_columna - columna);
@@ -186,30 +186,21 @@ int main(int nargs, char ** vargs){
 	//printf("F%d-C%d\n", num_fil_grid, num_col_grid);
 	dim3 grid(num_col_grid, num_fil_grid);
 
+	int num_blocks = num_col_grid * num_fil_grid;
 	// Colocar las antenas iniciales
 	for(int i=0; i<nAntenas; i++){
 		//printf("Colocando una antena en %d %d\n",antenas[i].fila, antenas[i].columna);
 		update<<< grid, block>>>(d_mapa, antenas[i].fila, antenas[i].columna, rows, cols);
 		if((error=cudaGetLastError()) != cudaSuccess)
-			printf("Error al llamar al kernel: %s\n", cudaGetErrorString( error ) );
-		/*else
-			printf("Una antena colocada correctamente\n");*/
+			printf("Error al colocar las primeras antenas: %s\n", cudaGetErrorString( error ) );
 	}
-	//Nos traemos la matriz para imprimirla y comprobar que este kernel funciona:
 
-	/*error = cudaMemcpy(h_mapa, d_mapa, sizeof(int)*rows*cols, cudaMemcpyDeviceToHost);
-	if(error != cudaSuccess)
-		printf("Error al copiar del device al host: %s\n", cudaGetErrorString( error ) );
-	else
-		print_mapa(h_mapa, rows,cols);*/
-	
 	//
 	// 3. CALCULO DE LAS NUEVAS ANTENAS
 	//
 
 	// Contador de antenas
 	int nuevas = 0;
-	//int *nuevaAntena;
 	int *antenaHost = (int*) malloc((size_t) 3 * sizeof(int) );
 	reduceAllocate(num_blocks);
 	while(1){
@@ -271,7 +262,7 @@ __global__ void update( int* mapa, const unsigned int a_fila, const unsigned int
 }
 
 
-__global__ void reduce_columns_kernel(const int* mapa, const unsigned int numfil, const unsigned int numcols, int* values, int* cols, const int nuevas){
+__global__ void reduce_columns_kernel(const int* mapa, const unsigned int numfil, const unsigned int numcols, int* values, int* cols){
     extern __shared__ unsigned int sdata[];
     // Obtenemos el elemento del mapa al que realmente ha de acceder este hilo
     unsigned int tid_row = threadIdx.y;
@@ -289,11 +280,9 @@ __global__ void reduce_columns_kernel(const int* mapa, const unsigned int numfil
 	else
 		sdata[2*tid] = 0;		
 	sdata[2*tid+1] = real_col;
-    //__syncthreads();
+    __syncthreads();
     
-    //Hacemos la reducción en memoria shared por filas hasta obtener una columna única
-    //si las filas son de 32 hilos no hace falta hacer sincronización ya que forman
-    //parte del mismo warp
+    //Hacemos la reducción en memoria shared por filas hasta obtener una columna única 
     for (unsigned int s=blockDim.x/2; s>0; s/=2) {
         if (tid_col < s) {
         	// Hacemos la reducción sumando los dos elementos que le tocan a este hilo
@@ -306,25 +295,23 @@ __global__ void reduce_columns_kernel(const int* mapa, const unsigned int numfil
         	       sdata[2*tid+1] = sdata[2*(tid+s)+1];
         	}
     	}
-        //__syncthreads();
+        __syncthreads();
     }
     
-    //Tenemos los maximos en la primera columna PERO!
-    //Quiero tener los maximos en las primeras filas
-    // MENTIRA... ya están por
+    //Tenemos los maximos en la primera columna
     if (tid_col == 0){
     	//Num de bloque?
     	unsigned int offset = blockDim.y * (blockIdx.x + blockIdx.y * gridDim.x);
+        //printf("Voy a guardar mi maximo en la pos: %d\n",offset+tid_row);
         values[offset + tid_row] =  sdata[2*tid];
         cols[offset + tid_row] = sdata[2*tid+1];
     }
 }
 
-__global__ void reduce_rows_kernel( int* vals, int* rows, int *cols, const int last){
+__global__ void reduce_rows_kernel( int* vals, int* rows, int *cols ){
     extern __shared__ unsigned int sdata[];
     // Identificador de hilo
-    unsigned int tid_row = threadIdx.y;
-    unsigned int tid_col = threadIdx.x;
+    unsigned int tid = threadIdx.x;
     
     // Localizado a la altura de la matriz:
     unsigned int real_row = blockDim.x * blockIdx.y + tid;
@@ -338,7 +325,7 @@ __global__ void reduce_rows_kernel( int* vals, int* rows, int *cols, const int l
     sdata[3*tid+2] = cols[ offset + tid ];
 
     //Sincronizamos para que todos hayan llegado a este punto
-    //__syncthreads();
+    __syncthreads();
     
     // Hacemos la reducción en memoria shared
     for (unsigned int s=blockDim.x/2; s>0; s/=2) {
@@ -356,62 +343,111 @@ __global__ void reduce_rows_kernel( int* vals, int* rows, int *cols, const int l
                 }
             }
         }
-        //__syncthreads();
+        __syncthreads();
     }
 
-    if(tid == 0){ // 
+    if(tid == 0){
         vals[offset]  = sdata[0];
         rows[blockId] = sdata[1];//identificador del bloque dentro del grid;
         cols[offset]  = sdata[2];
     }
 }
 
-__global__ void reduce_blocks_kernel(int* vals, int* rows, int* cols, const unsigned int lastBlock){
+__global__ void reduce_blocks_kernel(int* vals, int* rows, int* cols, const unsigned int lastBlock, const int reductionLevel, const int nuevas){
     extern __shared__ unsigned int sdata[];
     unsigned int tid = threadIdx.x;
     // Si estamos en el bloque 0, nos corresponden los bloques originales 0-1023.
     // En el bloque 1 nos corresponden del 1024-2047, etc.
-    unsigned int offset = MAX_THREADS * blockIdx.x; 
-    unsigned int bid = offset + tid;
+    unsigned int offset; 
+    unsigned int bid;
+    if(reductionLevel == 1){
+        bid = tid;
+        offset = blockIdx.x * MAX_THREADS;
+        bid += offset;
+    }
+    if(reductionLevel == 2){ // Suponiendo que solo hay un bloque :S
+        bid = tid * MAX_THREADS ;
+        offset = tid * MAX_THREADS;
+    }
+    
+    //if(reductionLevel == 1 && nuevas == 0 && tid == 0)
+    //    printf("Hilo: %d Bloque: %d Posiciones: %d y %d\n",tid, bid, BLOCK_DIM_FILAS * offset, offset);
+    //if(reductionLevel == 2 && nuevas == 0)
+    //    printf("Hilo: %d Bloque: %d Posiciones: %d y %d\n",tid, bid, BLOCK_DIM_FILAS * offset, offset);
+
     sdata[3*tid]   = 0;
     sdata[3*tid+1] = 0;
     sdata[3*tid+2] = 0;
     
-    if(bid < lastBlock){
+    if(bid < lastBlock && reductionLevel == 1){
         sdata[3*tid]   = vals[ BLOCK_DIM_FILAS * bid ];
         sdata[3*tid+1] = rows[ bid ];
         sdata[3*tid+2] = cols[ BLOCK_DIM_FILAS * bid ];
     }
     
+    if(tid < lastBlock && reductionLevel == 2){
+        sdata[3*tid]   = vals[ BLOCK_DIM_FILAS * offset ];
+        sdata[3*tid+1] = rows[ offset ];
+        sdata[3*tid+2] = cols[ BLOCK_DIM_FILAS * offset ];
+    }
     __syncthreads();
-
-    for (unsigned int s=MAX_THREADS/2; s>0; s/=2) {
-        if (tid < s && bid < lastBlock && (bid+s) < lastBlock) {
-            if(sdata[3*tid] < sdata[3*(tid+s)]){
-                sdata[3*tid] = sdata[3*(tid+s)];
-                sdata[3*tid+1] = sdata[3*(tid+s)+1];
-                sdata[3*tid+2] = sdata[3*(tid+s)+2];
-            }
-            else if(sdata[3*tid] == sdata[3*(tid+s)]){
-                //Actualizo en el caso de que su fila sea menor:
-                
-                if(sdata[3*tid+1] > sdata[3*(tid+s)+1]){
+    if(reductionLevel == 1){
+        for (unsigned int s=MAX_THREADS/2; s>0; s/=2) {
+            if (tid < s && bid < lastBlock && (bid+s) < lastBlock) {
+                if(sdata[3*tid] < sdata[3*(tid+s)]){
+                    sdata[3*tid] = sdata[3*(tid+s)];
                     sdata[3*tid+1] = sdata[3*(tid+s)+1];
                     sdata[3*tid+2] = sdata[3*(tid+s)+2];
                 }
-                //Si son de la misma fila, actualizo si la columna es mayor
-                else if(sdata[3*tid+1] == sdata[3*(tid+s)+1] && sdata[3*tid+2] > sdata[3*(tid+s)+2]){
-                    sdata[3*tid+2] = sdata[3*(tid+s)+2];
-                }                
+                else if(sdata[3*tid] == sdata[3*(tid+s)]){
+                    //Actualizo en el caso de que su fila sea menor:
+                    
+                    if(sdata[3*tid+1] > sdata[3*(tid+s)+1]){
+                        sdata[3*tid+1] = sdata[3*(tid+s)+1];
+                        sdata[3*tid+2] = sdata[3*(tid+s)+2];
+                    }
+                    //Si son de la misma fila, actualizo si la columna es mayor
+                    else if(sdata[3*tid+1] == sdata[3*(tid+s)+1] && sdata[3*tid+2] > sdata[3*(tid+s)+2]){
+                        sdata[3*tid+2] = sdata[3*(tid+s)+2];
+                    }                
+                }
             }
+            __syncthreads();
         }
-        __syncthreads();
+    }
+    else{
+        for (unsigned int s=MAX_THREADS/2; s>0; s/=2) {
+            if (tid < s && tid < lastBlock && (tid+s) < lastBlock) {
+                if(sdata[3*tid] < sdata[3*(tid+s)]){
+                    sdata[3*tid] = sdata[3*(tid+s)];
+                    sdata[3*tid+1] = sdata[3*(tid+s)+1];
+                    sdata[3*tid+2] = sdata[3*(tid+s)+2];
+                }
+                else if(sdata[3*tid] == sdata[3*(tid+s)]){
+                    //Actualizo en el caso de que su fila sea menor:
+                    
+                    if(sdata[3*tid+1] > sdata[3*(tid+s)+1]){
+                        sdata[3*tid+1] = sdata[3*(tid+s)+1];
+                        sdata[3*tid+2] = sdata[3*(tid+s)+2];
+                    }
+                    //Si son de la misma fila, actualizo si la columna es mayor
+                    else if(sdata[3*tid+1] == sdata[3*(tid+s)+1] && sdata[3*tid+2] > sdata[3*(tid+s)+2]){
+                        sdata[3*tid+2] = sdata[3*(tid+s)+2];
+                    }                
+                }
+            }
+            __syncthreads();
+        }    
     }
 
     if(tid == 0){
         vals[ BLOCK_DIM_FILAS * offset ] = sdata[0];
         rows[ offset ] = sdata[1];
         cols[ BLOCK_DIM_FILAS * offset ] = sdata[2];
+        /*if(reductionLevel == 1 && blockIdx.x == 3 && nuevas == 0)
+            printf("Bloque: %d Posiciones: %d y %d\n", bid,BLOCK_DIM_FILAS * offset, offset);
+        if(reductionLevel == 2 && nuevas == 0)
+            printf("Bloque: %d Posiciones: %d y %d\n", bid,BLOCK_DIM_FILAS * offset, offset);*/
     }
 }
 
@@ -423,8 +459,8 @@ __global__ void reduce_blocks_kernel(int* vals, int* rows, int* cols, const unsi
 //! @param num_blocks   Num de bloques sobre los que se hace la reduccion.
 //! @return int*        Vector de tres elementos: Distancia, Fila y Columna
 ///////////////////////////////////////////////////////////////////////////////////////////
+//int* maxDistance(const int* mapa, const unsigned int numfil, const unsigned int numcols, const dim3 grid, const dim3 block, const int nuevas){
 int* maxDistance(const int* mapa, const unsigned int numfil, const unsigned int numcols, const dim3 grid, const dim3 block, const int nuevas){
-//int* maxDistance(const int* mapa, const unsigned int numfil, const unsigned int numcols, const dim3 grid, const dim3 block){
     cudaError_t error;
     int numThreadsPerBlock = block.y * block.x; // NUMERO DE FILAS * NUMERO DE COLUMNAS
 
@@ -433,7 +469,7 @@ int* maxDistance(const int* mapa, const unsigned int numfil, const unsigned int 
     // donde se encontro dicho máximo, ya que la fila es constante.
     int sharedMemorySize = 2 * numThreadsPerBlock * sizeof(int);
 
-    reduce_columns_kernel<<<grid, block, sharedMemorySize>>>(mapa, numfil, numcols,val_Result, col_Result, nuevas);
+    reduce_columns_kernel<<<grid, block, sharedMemorySize>>>(mapa, numfil, numcols,val_Result, col_Result);
     if((error=cudaGetLastError()) != cudaSuccess)
         printf("Error al llamar al primer reduce kernel: %s\n", cudaGetErrorString( error ) );
     CUT_CHECK_ERROR("Kernel execution failed");
@@ -441,53 +477,49 @@ int* maxDistance(const int* mapa, const unsigned int numfil, const unsigned int 
     // En la segunda pasada cada bloque accederá a los 32 máximos locales encontrados previamente, y hará reducción
     // hasta obtener en la primera posición el máximo de su bloque. Para ello es necesario que los hilos de las reducciones
     // sepan el valor de la distancia, de la fila y de la columna mejores encontrados.
-    numThreadsPerBlock = MAX_THREADS; // ES EL NUMERO DE FILAS
-    int last = grid.x*grid.y*32;
-    int blocks = last / 1024;
-    if( last  % 1024)
-        blocks++; 
+    numThreadsPerBlock = block.y; // ES EL NUMERO DE FILAS
     sharedMemorySize = 3 * numThreadsPerBlock * sizeof(int);
-    reduce_rows_kernel<<< blocks, numThreadsPerBlock, sharedMemorySize>>>(val_Result, row_Result, col_Result, last);
+    reduce_rows_kernel<<< grid, numThreadsPerBlock, sharedMemorySize>>>(val_Result, row_Result, col_Result);
     if((error=cudaGetLastError()) != cudaSuccess)
         printf("Error al llamar al segundo reduce kernel: %s\n", cudaGetErrorString( error ) );
     CUT_CHECK_ERROR("Kernel execution failed");
-
-
+    
     // En la tercera pasada asignamos un bloque con hasta 1024 hilos para cada conjunto de hasta 1024 bloques con sus
     // máximos. Ésta puede ser la última reducción, en el caso de que haya menos de 1024 bloques, pero si hay mas será necesario
-    // hacer la última reducción.
+    // hacer más reducciones.
+    int inception = 0;
+    int blocks;
     numThreadsPerBlock = grid.x * grid.y;
-    blocks= numThreadsPerBlock / 1024;
-    if(numThreadsPerBlock % 1024)
-        blocks++; 
-    numThreadsPerBlock = MAX_THREADS;
+    int lastBlock = grid.x * grid.y;
+    do{
+        inception++;
+        if(numThreadsPerBlock > 1024){
+            if(!(numThreadsPerBlock%1024) )
+                blocks = numThreadsPerBlock/1024;
+            else
+                blocks = numThreadsPerBlock/1024 + 1;
 
-    sharedMemorySize = 3 * numThreadsPerBlock * sizeof(int);
-    reduce_blocks_kernel<<<blocks, numThreadsPerBlock, sharedMemorySize>>>(val_Result, row_Result, col_Result, grid.x*grid.y);
-    
+            sharedMemorySize = 3 * MAX_THREADS * sizeof(int);
+            //reduce_blocks_kernel<<<blocks, MAX_THREADS, sharedMemorySize>>>(val_Result, row_Result, col_Result, lastBlock, inception, nuevas);
+            reduce_blocks_kernel<<<blocks, MAX_THREADS, sharedMemorySize>>>(val_Result, row_Result, col_Result, blocks * 1024 + numThreadsPerBlock % 1024, inception, nuevas);
+            //if(!nuevas) printf("%d-%d-%d\n", inception, blocks, MAX_THREADS);
+            numThreadsPerBlock = blocks;
+        }
+        else{//Última reducción
+            blocks = 1;
+            sharedMemorySize = 3 * numThreadsPerBlock * sizeof(int);
+            reduce_blocks_kernel<<<blocks, numThreadsPerBlock, sharedMemorySize>>>(val_Result, row_Result, col_Result, numThreadsPerBlock, inception, nuevas);
+            //reduce_blocks_kernel<<<blocks, numThreadsPerBlock, sharedMemorySize>>>(val_Result, row_Result, col_Result, last, inception, nuevas);
+            //if(!nuevas) printf("%d-%d-%d\n", inception, blocks, numThreadsPerBlock);
+        }
+        
+    }
+    while(blocks > 1);
     int *result = (int*) malloc((size_t) 3 * sizeof(int) );
     
     cudaMemcpy(result, val_Result,  sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(&(result[1]), row_Result,  sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(&(result[2]), col_Result,  sizeof(int), cudaMemcpyDeviceToHost);
 
-    //Secuencializamos, ya lo haremos bien mas adelante:
-    for(int i = 1; i < blocks; i++){
-        int result2[3];
-        cudaMemcpy(result2, &val_Result[BLOCK_DIM_FILAS * MAX_THREADS * i],  sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&(result2[1]), &row_Result[MAX_THREADS * i],  sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&(result2[2]), &col_Result[BLOCK_DIM_FILAS * MAX_THREADS * i],  sizeof(int), cudaMemcpyDeviceToHost);
-        if(result[0] < result2[0]){
-            result[0] = result2[0];
-            result[1] = result2[1];
-            result[2] = result2[2];
-        }
-        else if(result[0] == result2[0]){
-            if(result[1] > result2[1] || (result[1] == result2[1] && result[2] > result2[2] ) ){
-                result[1] = result2[1];
-                result[2] = result2[2];       
-            }
-        }
-    }
     return result;
 }
